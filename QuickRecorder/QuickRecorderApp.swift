@@ -126,7 +126,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     func recordingDidFinishForTermination() {
         guard Self.waitingToTerminate else { return }
         Self.waitingToTerminate = false
-        NSApp.reply(toApplicationShouldTerminate: true)
+        // Cleanup may complete synchronously if no file request was issued.
+        // Reply only after applicationShouldTerminate returned terminateLater.
+        DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
     }
     
     @AppStorage("showOnDock")       var showOnDock: Bool = true
@@ -518,6 +520,9 @@ func createAlert(level: NSAlert.Style = .warning, title: String, message: String
 }
 
 func showAlertSyncOnMainThread(level: NSAlert.Style = .warning, title: String, message: String, button1: String, button2: String = "", width: Int? = nil) -> NSApplication.ModalResponse {
+    if Thread.isMainThread {
+        return createAlert(level: level, title: title, message: message, button1: button1, button2: button2, width: width).runModal()
+    }
     var response: NSApplication.ModalResponse = .abort
     let semaphore = DispatchSemaphore(value: 0)
     

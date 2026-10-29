@@ -2,7 +2,7 @@
 """Exercise production writer-finalization and mix functions using real AVFoundation.
 No capture permissions required. Generates only disposable fixtures under build/.
 UI, ScreenCaptureKit stopCapture, hardware microphones and low-space volumes are
-not covered. Requires Xcode command-line tools on macOS.
+not covered. Requires an existing Debug xcodebuild (SwiftLAME objects) and Xcode tools on macOS.
 """
 from pathlib import Path
 import subprocess
@@ -24,11 +24,22 @@ swift = r'''
 import Foundation
 import AVFoundation
 import CoreVideo
+import SwiftLAME
 
 let fd = FileManager.default
-extension String { var local: String { self } }
+extension String { var local: String { self }; var url: URL { URL(fileURLWithPath: self) } }
+struct TestDefaults { func integer(forKey: String) -> Int { 256 } }
+let ud = TestDefaults()
+enum StreamType { case systemaudio }
 enum VideoFormat: String { case mov, mp4 }
 class SCContext {
+    static let mediaLock = NSRecursiveLock()
+    static var isStopping = false
+    static var recordingSessionID: UUID?
+    static var systemAudioFramesWritten: AVAudioFramePosition = 0
+    static var streamType: StreamType?
+    static var filePath1: String?
+    static func failRecording(_ message: String) { failures.append(message) }
     static var vW: AVAssetWriter!
     static var audioFile: AVAudioFile?
     static var audioFile2: AVAudioFile?
@@ -46,6 +57,9 @@ class SCContext {
 '''
 swift += member('static func remainingCapacity(')
 swift += member('private static func finishRecordingWriter(')
+swift += member('static func writeSystemAudio(')
+swift += member('static func validateSystemAudioFile(')
+swift += member('static func m4a2mp3(')
 swift += member('static func mixAudioTracks(')
 swift += r'''
 }
@@ -59,12 +73,12 @@ func waitUntil(_ ready: () -> Bool) throws {
 }
 let work = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 func fixture(_ name: String) -> URL { work.appendingPathComponent(name) }
-func writeTone(_ url: URL) throws {
+func writeTone(_ url: URL, seconds: Int = 1) throws {
     let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
-    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48000)!
-    buffer.frameLength = 48000
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(48000 * seconds))!
+    buffer.frameLength = AVAudioFrameCount(48000 * seconds)
     for channel in 0..<2 {
-        for i in 0..<48000 { buffer.floatChannelData![channel][i] = Float(sin(Double(i) * 2 * .pi * 440 / 48000) * 0.1) }
+        for i in 0..<(48000 * seconds) { buffer.floatChannelData![channel][i] = Float(sin(Double(i) * 2 * .pi * 440 / 48000) * 0.1) }
     }
     var file: AVAudioFile? = try AVAudioFile(forWriting: url, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2])
     try file!.write(from: buffer)
@@ -175,11 +189,112 @@ func checkWriterBarrier() throws {
     try waitUntil { SCContext.done }
     try require(!SCContext.successful && SCContext.failures.count == 2, "Empty system audio incorrectly succeeded")
     print("PASS: empty system audio without a writer reports failure")
+    let oldID = UUID(), currentID = UUID()
+    SCContext.recordingSessionID = oldID
+    SCContext.done = false
+    SCContext.finishForTest()
+    SCContext.recordingSessionID = currentID
+    RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+    try require(!SCContext.done && SCContext.recordingSessionID == currentID, "Late writer completion mutated new session")
+    SCContext.recordingSessionID = nil
+    print("PASS: stale writer completion cannot clear a replacement session")
+
 }
+
+func checkSystemAudio() throws {
+    SCContext.streamType = .systemaudio
+    SCContext.vW = nil
+    SCContext.startTime = Date() // A clock value must never prove a write occurred.
+    SCContext.filePath1 = fixture("empty-system.m4a").path
+    SCContext.filePath = SCContext.filePath1
+    SCContext.done = false
+    SCContext.successful = false
+    SCContext.failures = []
+    SCContext.finishForTest()
+    try waitUntil { SCContext.done }
+    try require(!SCContext.successful && SCContext.failures.count == 1, "Clock-only audio incorrectly succeeded")
+    let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48000)!
+    buffer.frameLength = 48000
+    for channel in 0..<2 { for i in 0..<48000 { buffer.floatChannelData![channel][i] = 0 } }
+    SCContext.failures = []
+    SCContext.writeSystemAudio(buffer) // No file: optional chaining must not count a write.
+    try require(SCContext.systemAudioFramesWritten == 0 && SCContext.failures.count == 1, "Missing writer accepted samples")
+    let path = fixture("system-written.m4a")
+    SCContext.filePath1 = path.path
+    SCContext.filePath = path.path
+    SCContext.failures = []
+    SCContext.audioFile = try AVAudioFile(forWriting: path, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2], commonFormat: .pcmFormatFloat32, interleaved: false)
+    SCContext.writeSystemAudio(buffer)
+    try require(SCContext.systemAudioFramesWritten == 48000, "Successful frames not counted")
+    SCContext.done = false
+    SCContext.recordingError = nil
+    SCContext.finishForTest()
+    try waitUntil { SCContext.done }
+    try require(SCContext.successful && SCContext.failures.isEmpty, "Written system audio failed final validation")
+    try checkDecodable(path, video: 0, audio: 1)
+    try fd.removeItem(at: path)
+    SCContext.successful = false
+    SCContext.done = false
+    SCContext.finishForTest()
+    try waitUntil { SCContext.done }
+    try require(!SCContext.successful && SCContext.failures.count == 1, "Deleted finalized audio incorrectly succeeded")
+    SCContext.streamType = nil
+    SCContext.recordingError = nil
+    print("PASS: system audio requires successful samples and a readable finalized file")
+}
+func checkMP3() throws {
+    let source = fixture("tone.m4a")
+    let original = try Data(contentsOf: source)
+    let target = fixture("converted.mp3")
+    var result: Result<Void, Error>?
+    func convert(_ input: URL, _ output: URL) {
+        result = nil
+        Task {
+            do { try await SCContext.m4a2mp3(inputUrl: input, outputUrl: output); result = .success(()) }
+            catch { result = .failure(error) }
+        }
+    }
+    convert(source, target)
+    try waitUntil { result != nil }
+    try result!.get()
+    try require(try AVAudioFile(forReading: target).length > 0, "Converted MP3 unreadable")
+    let existing = try Data(contentsOf: target)
+    convert(source, target)
+    try waitUntil { result != nil }
+    if case .success = result! { throw NSError(domain: "Existing MP3 was accepted", code: 1) }
+    try require(try Data(contentsOf: target) == existing, "Existing MP3 modified")
+    convert(fixture("absent.m4a"), fixture("failed.mp3"))
+    try waitUntil { result != nil }
+    if case .success = result! { throw NSError(domain: "Invalid MP3 input accepted", code: 1) }
+    try require(try Data(contentsOf: source) == original, "Conversion failure removed source")
+    try require(try fd.contentsOfDirectory(atPath: work.path).filter { $0.hasPrefix(".qr-") }.isEmpty, "Temporary MP3 leaked")
+    print("PASS: real SwiftLAME MP3 conversion, existing target refusal, failure source retention")
+    let longSource = fixture("long-tone.m4a")
+    try writeTone(longSource, seconds: 60)
+    let racedTarget = fixture("raced.mp3")
+    convert(longSource, racedTarget)
+    try waitUntil {
+        ((try? fd.contentsOfDirectory(atPath: work.path).contains { $0.hasPrefix(".qr-") }) ?? false) || result != nil
+    }
+    try require(result == nil, "Race fixture finished before a concurrent destination could be created")
+    let sentinel = Data("created during encoding".utf8)
+    try sentinel.write(to: racedTarget)
+    try waitUntil { result != nil }
+    if case .success = result! { throw NSError(domain: "Concurrent MP3 target accepted", code: 1) }
+    try require(try Data(contentsOf: racedTarget) == sentinel, "Concurrent MP3 target modified")
+    try require(fd.fileExists(atPath: longSource.path), "MP3 publication failure removed source")
+    try require(try fd.contentsOfDirectory(atPath: work.path).filter { $0.hasPrefix(".qr-") }.isEmpty, "Raced MP3 temporary file leaked")
+    print("PASS: MP3 target created during encoding is preserved; source and cleanup retained")
+
+}
+
 do {
     try writeTone(fixture("tone.m4a"))
     try writeVideo(fixture("video.mp4"))
     try checkWriterBarrier()
+    try checkSystemAudio()
+    try checkMP3()
     let unrelated = fixture("next-recording.mp4")
     try Data("keep".utf8).write(to: unrelated)
     SCContext.filePath = unrelated.path
@@ -250,10 +365,6 @@ swift = swift.replace('    static var vW:', r'''
     static func updateAudioSettings(format: String) -> [String: Any] {
         [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2]
     }
-    // MP3 uses the app's SwiftLAME dependency and is outside this harness.
-    static func m4a2mp3(inputUrl: URL, outputUrl: URL) async throws {
-        throw NSError(domain: "MP3 conversion not exercised by this harness", code: 1)
-    }
     static var vW:''', 1)
 swift = swift.replace('    try checkWriterBarrier()', r'''
     try checkWriterBarrier()
@@ -286,6 +397,11 @@ swift = swift.replace('    try checkWriterBarrier()', r'''
 # Each run gets fresh fixtures; never delete user-supplied paths.
 import tempfile
 with tempfile.TemporaryDirectory(prefix='fixtures-', dir=work) as fixtures:
+    products = root / 'build/Build/Products/Debug'
+    modulemap = root / 'build/Build/Intermediates.noindex/GeneratedModuleMaps/LAME.modulemap'
     subprocess.run(['xcrun', 'swiftc', '-suppress-warnings', '-swift-version', '5', '-module-cache-path', str(work / 'module-cache'),
+                    '-I', str(products), '-Xcc', f'-fmodule-map-file={modulemap}',
+                    '-Xcc', '-I' + str(root / 'build/SourcePackages/checkouts/SwiftLAME/Sources/LAME/include'),
+                    str(products / 'SwiftLAME.o'), str(products / 'LAME.o'),
                     str(work / 'main.swift'), '-o', str(work / 'verify-media')], check=True)
     subprocess.run([str(work / 'verify-media'), fixtures], check=True)

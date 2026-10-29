@@ -53,6 +53,8 @@ class AVOutputClass: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureVi
     static let shared = AVOutputClass()
     var output: AVCaptureMovieFileOutput!
     var dataOutput: AVCaptureVideoDataOutput!
+    // The requested file output is independent of isRecording and preview output.
+    private var recordingOutput: AVCaptureMovieFileOutput?
     //var captureSession: AVCaptureSession!
     
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -60,6 +62,10 @@ class AVOutputClass: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureVi
     }
     
     public func startRecording(with device: AVCaptureDevice, mute: Bool = false, preset: AVCaptureSession.Preset = .high, didOutput: Bool = true) {
+        if didOutput && !Thread.isMainThread {
+            DispatchQueue.main.async { self.startRecording(with: device, mute: mute, preset: preset, didOutput: didOutput) }
+            return
+        }
         if didOutput, SCContext.streamType != nil { return }
         if didOutput, !SCContext.checkRecordingSpace(at: URL(fileURLWithPath: ud.string(forKey: "saveDirectory") ?? NSHomeDirectory())) { return }
         output = AVCaptureMovieFileOutput()
@@ -106,8 +112,12 @@ class AVOutputClass: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureVi
             let fileEnding = ud.string(forKey: "videoFormat") ?? ""
             SCContext.filePath = "\(SCContext.getFilePath()).\(fileEnding)"
             SCContext.captureSession.startRunning()
-            output.startRecording(to: SCContext.filePath.url, recordingDelegate: self)
+            recordingOutput = output
+            SCContext.mediaLock.lock()
+            SCContext.recordingSessionID = UUID()
             SCContext.streamType = StreamType.idevice
+            SCContext.mediaLock.unlock()
+            output.startRecording(to: SCContext.filePath.url, recordingDelegate: self)
             SCContext.startTime = Date.now
             SCContext.startDiskSpaceMonitor()
         }
@@ -121,13 +131,30 @@ class AVOutputClass: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureVi
     }
 
     public func stopRecording() {
-        if let output = output, output.isRecording, !SCContext.isStopping {
-            SCContext.mediaLock.lock()
-            SCContext.isStopping = true
-            SCContext.mediaLock.unlock()
-            SCContext.diskSpaceTimer?.invalidate()
-            SCContext.diskSpaceTimer = nil
-            output.stopRecording()
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.stopRecording() }
+            return
+        }
+        guard SCContext.streamType == .idevice, !SCContext.isStopping else { return }
+        SCContext.mediaLock.lock()
+        SCContext.isStopping = true
+        SCContext.mediaLock.unlock()
+        SCContext.diskSpaceTimer?.invalidate()
+        SCContext.diskSpaceTimer = nil
+        if let recordingOutput = recordingOutput {
+            // A request may still be starting, or already finishing with an error.
+            // isRecording only describes new sample collection, not completion.
+            recordingOutput.stopRecording()
+        } else {
+            SCContext.reportSaveFailure("No device recording request is pending.", path: SCContext.filePath ?? "")
+            SCContext.completeRecordingStop()
+        }
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
+        DispatchQueue.main.async {
+            guard output === self.recordingOutput, SCContext.streamType == .idevice else { return }
+            if SCContext.isStopping { output.stopRecording() }
         }
     }
     
@@ -141,7 +168,8 @@ class AVOutputClass: NSObject, AVCaptureFileOutputRecordingDelegate, AVCaptureVi
 
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
         DispatchQueue.main.async {
-            guard output === self.output, SCContext.streamType == .idevice else { return }
+            guard output === self.recordingOutput, SCContext.streamType == .idevice else { return }
+            self.recordingOutput = nil
             SCContext.diskSpaceTimer?.invalidate()
             SCContext.diskSpaceTimer = nil
             let nsError = error as NSError?

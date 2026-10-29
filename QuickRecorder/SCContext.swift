@@ -20,6 +20,9 @@ class SCContext {
     static let mediaLock = NSRecursiveLock()
     static let captureQueue = DispatchQueue(label: "QuickRecorder.capture")
     static var isStopping = false
+    static var recordingSessionID: UUID?
+    static var captureStartPending = false
+    static var systemAudioFramesWritten: AVAudioFramePosition = 0
     static var recordingError: String?
     static var stopMicrophone: (() -> Void)?
     static var shouldMixAudio = false
@@ -56,8 +59,10 @@ class SCContext {
         mediaLock.lock()
         guard !isStopping, recordingError == nil else { mediaLock.unlock(); return }
         recordingError = message
+        let sessionID = recordingSessionID
         mediaLock.unlock()
         DispatchQueue.main.async {
+            guard recordingSessionID == sessionID else { return }
             if streamType == .idevice { AVOutputClass.shared.stopRecording() } else { stopRecording() }
         }
     }
@@ -418,9 +423,40 @@ class SCContext {
         // callback which itself needs the lock. Late callbacks now discard samples.
         stopMicrophone?()
         stopMicrophone = nil
+        // A start request cannot be cancelled by finalizing its writer first.
+        // Its completion will observe isStopping and perform the stop exactly once.
+        guard !captureStartPending else { return }
+        stopCaptureAndFinish(sessionID: recordingSessionID)
+    }
+
+    static func finishCaptureStart(sessionID: UUID, error: Error? = nil) -> Bool {
+        mediaLock.lock()
+        guard recordingSessionID == sessionID else { mediaLock.unlock(); return false }
+        captureStartPending = false
+        if let error = error {
+            stream = nil
+            if recordingError == nil { recordingError = error.localizedDescription }
+        }
+        let stopRequested = isStopping
+        mediaLock.unlock()
+        if error != nil {
+            if stopRequested { stopCaptureAndFinish(sessionID: sessionID) }
+            else { stopRecording() }
+            return false
+        }
+        if stopRequested {
+            stopCaptureAndFinish(sessionID: sessionID)
+            return false
+        }
+        return true
+    }
+
+    private static func stopCaptureAndFinish(sessionID: UUID?) {
+        guard recordingSessionID == sessionID else { return }
         if let recordingStream = stream {
             recordingStream.stopCapture { error in
                 DispatchQueue.main.async {
+                    guard recordingSessionID == sessionID else { return }
                     if let error = error, recordingError == nil { recordingError = error.localizedDescription }
                     finishRecordingWriter()
                 }
@@ -434,23 +470,26 @@ class SCContext {
         // All append/write callbacks passed through mediaLock before isStopping
         // was set. Nothing may append once inputs have been marked finished.
         let writer = vW
+        let sessionID = recordingSessionID
         let finished: () -> Void = {
             DispatchQueue.main.async {
+                guard recordingSessionID == sessionID else { return }
                 audioFile = nil
                 audioFile2 = nil
-                if writer == nil && startTime == nil && recordingError == nil {
-                    reportSaveFailure("No media samples were written.", path: filePath ?? "")
+                if streamType == .systemaudio && recordingError == nil {
+                    do { try validateSystemAudioFile() }
+                    catch { recordingError = error.localizedDescription }
+                } else if writer == nil && startTime == nil && recordingError == nil {
+                    recordingError = "No media samples were written."
+                }
+                if let reason = recordingError {
+                    reportSaveFailure(reason, path: filePath ?? "")
                     completeRecordingStop()
                     return
                 }
                 if let writer = writer, writer.status != .completed {
                     let reason = recordingError ?? writer.error?.localizedDescription ?? "No media samples were written."
                     reportSaveFailure(reason, path: filePath ?? writer.outputURL.path)
-                    completeRecordingStop()
-                    return
-                }
-                if let reason = recordingError {
-                    reportSaveFailure(reason, path: filePath ?? "")
                     completeRecordingStop()
                     return
                 }
@@ -476,6 +515,26 @@ class SCContext {
         showNotification(title: "Failed to save file".local,
                          body: "\(reason)\nFiles retained at: \(path)",
                          id: "quickrecorder.error.\(UUID().uuidString)")
+    }
+
+    static func writeSystemAudio(_ samples: AVAudioPCMBuffer) {
+        mediaLock.lock()
+        defer { mediaLock.unlock() }
+        guard !isStopping, samples.frameLength > 0 else { return }
+        do {
+            guard let file = audioFile else {
+                throw NSError(domain: "QuickRecorder.Audio", code: 4, userInfo: [NSLocalizedDescriptionKey: "System audio file is not open."])
+            }
+            try file.write(from: samples)
+            systemAudioFramesWritten += AVAudioFramePosition(samples.frameLength)
+        } catch { failRecording(error.localizedDescription) }
+    }
+
+    static func validateSystemAudioFile() throws {
+        guard systemAudioFramesWritten > 0, let path = filePath1,
+              try AVAudioFile(forReading: path.url).length > 0 else {
+            throw NSError(domain: "QuickRecorder.Audio", code: 5, userInfo: [NSLocalizedDescriptionKey: "No readable system audio samples were saved."])
+        }
     }
 
     private static func processFinishedRecording() {
@@ -573,6 +632,9 @@ class SCContext {
         micInput = nil
         stream = nil
         streamType = nil
+        recordingSessionID = nil
+        captureStartPending = false
+        systemAudioFramesWritten = 0
         startTime = nil
         firstFrame = nil
         lastPTS = nil
@@ -610,6 +672,11 @@ class SCContext {
     }
     
     static func m4a2mp3(inputUrl: URL, outputUrl: URL) async throws {
+        guard !fd.fileExists(atPath: outputUrl.path) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError)
+        }
+        let temporaryURL = outputUrl.deletingLastPathComponent().appendingPathComponent(".qr-\(UUID().uuidString).mp3")
+        defer { try? fd.removeItem(at: temporaryURL) }
         let progress = Progress()
         let lameEncoder = try SwiftLameEncoder(
             sourceUrl: inputUrl,
@@ -618,10 +685,16 @@ class SCContext {
                 bitrateMode: .constant(Int32(ud.integer(forKey: "audioQuality"))),
                 quality: .nearBest
             ),
-            destinationUrl: outputUrl,
+            destinationUrl: temporaryURL,
             progress: progress // optional
         )
         try await lameEncoder.encode(priority: .userInitiated)
+        guard try AVAudioFile(forReading: temporaryURL).length > 0 else {
+            throw NSError(domain: "QuickRecorder.Audio", code: 6, userInfo: [NSLocalizedDescriptionKey: "MP3 conversion produced no readable samples."])
+        }
+        // moveItem refuses an existing destination, including one created while
+        // encoding was in progress. Never append to or replace that file.
+        try fd.moveItem(at: temporaryURL, to: outputUrl)
     }
     
     static func trimVideo() {
