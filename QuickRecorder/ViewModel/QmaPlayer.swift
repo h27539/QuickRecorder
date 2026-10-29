@@ -558,78 +558,89 @@ class AudioPlayerManager: ObservableObject {
         }
     }
     
-    func saveFile(_ url: URL, saveAsMP3: Bool = false) {
+    func saveFile(_ url: URL, saveAsMP3: Bool = false, completion: ((Result<URL, Error>) -> Void)? = nil) {
+        guard !exporting else {
+            completion?(.failure(NSError(domain: "QuickRecorder.Audio", code: 3, userInfo: [NSLocalizedDescriptionKey: "An audio export is already in progress."])))
+            return
+        }
+        exporting = true
         var url = url
         if url.pathExtension == "mp3" { url = url.deletingPathExtension() }
         if url.pathExtension != self.fileFormat { url = url.appendingPathExtension(self.fileFormat) }
-        let lastComp = url.lastPathComponent
-        if self.exportMP3 { url = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent) }
-        
+        let finalURL = saveAsMP3 ? url.deletingPathExtension().appendingPathExtension("mp3") : url
+        if saveAsMP3 { url = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent) }
+        let intermediateURL = url
         Thread.detachNewThread {
-            DispatchQueue.main.async { self.exporting = true }
+            let finish: (Result<URL, Error>) -> Void = { result in
+                DispatchQueue.main.async {
+                    self.exporting = false
+                    if case .success(let output) = result {
+                        SCContext.showNotification(title: "Recording Completed".local,
+                            body: String(format: "File saved to: %@".local, output.path),
+                            id: "quickrecorder.completed.\(UUID().uuidString)")
+                    } else if completion == nil, case .failure(let error) = result {
+                        SCContext.reportSaveFailure(error.localizedDescription, path: self.packageURL?.path ?? intermediateURL.path)
+                    }
+                    completion?(result)
+                }
+            }
             do {
-                guard let audioFile1 = self.audioFile1, let audioFile2 = self.audioFile2 else { return }
+                guard let audioFile1 = self.audioFile1, let audioFile2 = self.audioFile2 else {
+                    throw NSError(domain: "QuickRecorder.Audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to read both audio tracks."])
+                }
+                // Automatic recording export must not replace an existing file.
+                // Manual export keeps NSSavePanel's explicit replacement choice.
+                if completion != nil && (fd.fileExists(atPath: intermediateURL.path) || fd.fileExists(atPath: finalURL.path)) {
+                    throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteFileExistsError)
+                }
+                self.engine.stop()
                 self.playerNode1.scheduleFile(audioFile1, at: nil, completionHandler: nil)
                 self.playerNode2.scheduleFile(audioFile2, at: nil, completionHandler: nil)
-                
                 let audioSettings = SCContext.updateAudioSettings(format: self.fileEncoder)
                 let outputFormat = self.playerNode1.outputFormat(forBus: 0)
-                let outputFile = try AVAudioFile(forWriting: url, settings: audioSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
-                self.engine.stop()
+                var outputFile: AVAudioFile? = try AVAudioFile(forWriting: intermediateURL, settings: audioSettings, commonFormat: .pcmFormatFloat32, interleaved: false)
+                defer { outputFile = nil }
                 try self.engine.enableManualRenderingMode(.offline, format: outputFormat, maximumFrameCount: 4096)
+                defer {
+                    self.engine.stop()
+                    self.engine.disableManualRenderingMode()
+                    self.setupAudioEngine()
+                }
                 try self.engine.start()
-                
                 self.playerNode1.play()
                 self.playerNode2.play()
-                
-                let duration = audioFile1.length
+                let seconds = max(Double(audioFile1.length) / audioFile1.processingFormat.sampleRate,
+                                  Double(audioFile2.length) / audioFile2.processingFormat.sampleRate)
+                let duration = AVAudioFramePosition(seconds * outputFormat.sampleRate)
                 let buffer = AVAudioPCMBuffer(pcmFormat: self.engine.manualRenderingFormat, frameCapacity: self.engine.manualRenderingMaximumFrameCount)!
-                
+                var retries = 0
                 while self.engine.manualRenderingSampleTime < duration {
-                    let framesToRender = min(UInt32(buffer.frameCapacity), UInt32(duration - self.engine.manualRenderingSampleTime))
-                    let status = try self.engine.renderOffline(framesToRender, to: buffer)
+                    let frames = min(AVAudioFramePosition(buffer.frameCapacity), duration - self.engine.manualRenderingSampleTime)
+                    let status = try self.engine.renderOffline(AVAudioFrameCount(frames), to: buffer)
                     switch status {
                     case .success:
-                        try outputFile.write(from: buffer)
+                        try outputFile?.write(from: buffer)
+                        retries = 0
                     case .insufficientDataFromInputNode, .cannotDoInCurrentContext:
-                        // Handle the cases where rendering cannot proceed
-                        break
+                        retries += 1
+                        if retries < 100 { continue }
+                        fallthrough
                     default:
-                        // Handle other cases if needed
-                        break
+                        throw NSError(domain: "QuickRecorder.Audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Offline audio rendering failed."])
                     }
                 }
-                
-                self.engine.disableManualRenderingMode()
-                self.engine.stop()
-                self.setupAudioEngine()
-                
-                let title = "Recording Completed".local
-                var body = String(format: "File saved to: %@".local, url.path.removingPercentEncoding!)
-                let id = "quickrecorder.completed.\(UUID().uuidString)"
-                
+                // AVAudioFile must be closed before conversion reads its index.
+                outputFile = nil
                 if saveAsMP3 {
-                    let oldURL = url
-                    let newURl = url.deletingLastPathComponent().appendingPathComponent(lastComp).deletingPathExtension().appendingPathExtension("mp3")
-                    body = String(format: "File saved to: %@".local, newURl.path.removingPercentEncoding!)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        Task {
-                            do {
-                                try await SCContext.m4a2mp3(inputUrl: oldURL, outputUrl: newURl)
-                                try? fd.removeItem(at: oldURL)
-                            } catch {
-                                SCContext.showNotification(title: "Failed to save file".local, body: "\(error.localizedDescription)", id: "quickrecorder.error.\(UUID().uuidString)")
-                                return
-                            }
-                        }
+                    Task {
+                        do {
+                            try await SCContext.m4a2mp3(inputUrl: intermediateURL, outputUrl: finalURL)
+                            try? fd.removeItem(at: intermediateURL)
+                            finish(.success(finalURL))
+                        } catch { finish(.failure(error)) }
                     }
-                }
-                
-                SCContext.showNotification(title: title, body: body, id: id)
-            } catch {
-                SCContext.showNotification(title: "Failed to save file".local, body: "\(error.localizedDescription)", id: "quickrecorder.error.\(UUID().uuidString)")
-            }
-            DispatchQueue.main.async { self.exporting = false }
+                } else { finish(.success(finalURL)) }
+            } catch { finish(.failure(error)) }
         }
     }
     

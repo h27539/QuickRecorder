@@ -113,6 +113,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     var isResizing = false
     var presenterType = "OFF"
     var frameQueue = FixedLengthArray<CMTime>(maxLength: 20)
+    private static var waitingToTerminate = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard SCContext.streamType != nil else { return .terminateNow }
+        Self.waitingToTerminate = true
+        if SCContext.streamType == .idevice { AVOutputClass.shared.stopRecording() }
+        else { SCContext.stopRecording() }
+        return .terminateLater
+    }
+
+    func recordingDidFinishForTermination() {
+        guard Self.waitingToTerminate else { return }
+        Self.waitingToTerminate = false
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
     
     @AppStorage("showOnDock")       var showOnDock: Bool = true
     @AppStorage("showMenubar")      var showMenubar: Bool = false
@@ -187,6 +202,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
     }
     
     func applicationWillTerminate(_ aNotification: Notification) {
+        removeStatusBarEventLocationFix()
         if SCContext.stream != nil { SCContext.stopRecording() }
     }
     
@@ -263,6 +279,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SCStreamDelegate, SCStreamOu
 
         statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusBarItem.button?.image = NSImage()
+        installStatusBarEventLocationFix()
 
         mousePointer.title = "Mouse Pointer".local
         mousePointer.level = .screenSaver

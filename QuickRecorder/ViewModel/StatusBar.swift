@@ -6,6 +6,43 @@
 //
 
 import SwiftUI
+import AppKit
+
+// Retain one monitor for the application's lifetime. Ordinary windows (including
+// the floating controller and popovers) must keep their original event path.
+private var statusBarEventMonitor: Any?
+
+func installStatusBarEventLocationFix() {
+    guard #available(macOS 27, *), statusBarEventMonitor == nil else { return }
+    statusBarEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]) { event in
+        guard let window = event.window,
+              window === statusBarItem?.button?.window else { return event }
+        let location = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        guard abs(location.x - event.locationInWindow.x) > 0.5 ||
+              abs(location.y - event.locationInWindow.y) > 0.5 else { return event }
+        return NSEvent.mouseEvent(with: event.type, location: location,
+                                 modifierFlags: event.modifierFlags, timestamp: event.timestamp,
+                                 windowNumber: event.windowNumber, context: nil,
+                                 eventNumber: event.eventNumber, clickCount: event.clickCount,
+                                 pressure: event.pressure) ?? event
+    }
+}
+
+func removeStatusBarEventLocationFix() {
+    if let monitor = statusBarEventMonitor { NSEvent.removeMonitor(monitor) }
+    statusBarEventMonitor = nil
+}
+
+private func recordingStatusItemIsVisible() -> Bool {
+    guard statusBarItem.isVisible, let button = statusBarItem.button,
+          let window = button.window, window.occlusionState.contains(.visible) else { return false }
+    let rect = window.convertToScreen(button.convert(button.bounds, to: nil))
+    // occlusionState can report visible even when a crowded status item is off-screen.
+    return NSScreen.screens.contains { screen in
+        rect.minX >= screen.frame.minX && rect.maxX <= screen.frame.maxX &&
+        rect.maxY > screen.frame.minY && rect.minY < screen.frame.maxY
+    }
+}
 
 class PopoverState: ObservableObject {
     static let shared = PopoverState()
@@ -138,15 +175,19 @@ struct StatusBarItem: View {
                 .onReceive(updateTimer) { t in
                     recordingLength = SCContext.getRecordingLength()
                     let timePassed = Date.now.timeIntervalSince(SCContext.startTime ?? t)
-                    if SCContext.autoStop != 0 && timePassed / 60 >= CGFloat(SCContext.autoStop) { SCContext.stopRecording() }
-                    if let visible = statusBarItem.button?.window?.occlusionState.contains(.visible) {
+                    if SCContext.autoStop != 0 && timePassed / 60 >= CGFloat(SCContext.autoStop) {
+                        if SCContext.streamType == .idevice { AVOutputClass.shared.stopRecording() }
+                        else { SCContext.stopRecording() }
+                    }
+                    if statusBarItem.button != nil {
+                        let visible = recordingStatusItemIsVisible()
                         if visible { NSApp.windows.first(where: { $0.title == "Recording Controller".local })?.close(); return }
                         if SCContext.streamType != nil  && !visible && !(NSApp.windows.first(where: { $0.title == "Recording Controller".local })?.isVisible ?? false) {
                             guard let screen = SCContext.getScreenWithMouse() else { return }
                             let width = getStatusBarWidth()
-                            let wX = (screen.frame.width - width) / 2
+                            let wX = screen.visibleFrame.midX - width / 2
                             let contentView = NSHostingView(rootView: StatusBarItem())
-                            contentView.frame = NSRect(x: wX, y: screen.visibleFrame.maxY, width: width, height: 24)
+                            contentView.frame = NSRect(x: wX, y: screen.visibleFrame.maxY - 24, width: width, height: 24)
                             controlPanel.setFrame(contentView.frame, display: true)
                             controlPanel.contentView = contentView
                             controlPanel.makeKeyAndOrderFront(nil)
@@ -230,10 +271,16 @@ func updateStatusBar() {
         }
         guard let button = statusBarItem.button else { return }
         //let width = SCContext.streamType == nil ? 36 : ((SCContext.streamType == .idevice || SCContext.streamType == .systemaudio) ? 138 : 158)
-        let iconView = NSHostingView(rootView: StatusBarItem().padding(.top, isMacOS14 ? -2 : -1))
-        iconView.frame = NSRect(x: 0, y: 1, width: getStatusBarWidth(), height: isMacOS14 ? 22 : 21)
+        statusBarItem.length = getStatusBarWidth()
+        let iconView = NSHostingView(rootView: StatusBarItem().frame(height: 22))
+        iconView.translatesAutoresizingMaskIntoConstraints = false
         button.subviews = [iconView]
-        button.frame = iconView.frame
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            iconView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            iconView.topAnchor.constraint(equalTo: button.topAnchor),
+            iconView.bottomAnchor.constraint(equalTo: button.bottomAnchor)
+        ])
         button.setAccessibilityLabel("QuickRecorder")
         statusBarItem.isVisible = true
     }
